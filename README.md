@@ -37,7 +37,7 @@ bash wg.sh --auto
 ```bash
 bash wg.sh --auto --555
 ```
--bash wg.sh --auto --555 这样就是使用555端口
+- bash wg.sh --auto --555 这样就是使用555端口
 
 - 默认 WireGuard 监听 **53/UDP**，自动选择 DNS，并部署 + 对外暴露 Web/API（**5666**）。
 - 安装完成后会打印 **Web 访问地址、用户名/密码、API 管理员令牌**，请妥善保存。
