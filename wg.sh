@@ -1802,8 +1802,10 @@ def api_restart():
     now = time.time()
     last = getattr(app, "_last_restart_ts", 0)
     if now - last < 5:
+        append_audit("忽略重启请求", "5 秒内重复请求", client_ip())
         return jsonify({"success": True, "message": "重启请求过于频繁，已忽略（5 秒内仅一次）"})
     app._last_restart_ts = now
+    append_audit("重启 WireGuard", "Web 重启", client_ip())
     run(["systemctl","reset-failed","wg-quick@wg0"])
     out, err, code = run(["systemctl","restart","wg-quick@wg0"])
     if code != 0: return jsonify({"error":err or out}), 500
@@ -4859,6 +4861,38 @@ if ! systemctl is-active --quiet wg-limiter.timer; then
     systemctl start wg-limiter.timer 2>/dev/null || true
   fi
 fi
+# ---------- 重启风暴检测：5 分钟内 wg-quick 被反复拉起则告警（只记录，不干预，避免加重）----------
+STORM_FILE="$DATA_DIR/storm_state.json"
+python3 - "$STORM_FILE" <<'PY'
+import json, os, subprocess, sys, time, datetime
+f = sys.argv[1]
+# 统计最近 5 分钟 systemd 日志中 wg-quick 的启动次数
+try:
+    out = subprocess.run(["journalctl", "-u", "wg-quick@wg0", "--since", "-5min", "--no-pager"],
+                         capture_output=True, text=True, timeout=10).stdout
+except Exception:
+    out = ""
+n = sum(1 for l in out.splitlines() if "Starting wg-quick@wg0" in l or "Starting WireGuard via wg-quick" in l)
+now = time.time()
+if os.path.exists(f):
+    try: st = json.load(open(f))
+    except Exception: st = {}
+else:
+    st = {}
+if n >= 12 and now - float(st.get("last_alert", 0)) > 1800:
+    st["last_alert"] = now
+    st["count"] = n
+    try:
+        with open("/opt/wireguard-web/data/audit.log", "a") as a:
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            a.write(json.dumps({"ts": ts, "action": "重启风暴告警",
+                                "detail": f"5 分钟内 wg-quick@wg0 被启动 {n} 次，疑似外部脚本/面板反复重启",
+                                "ip": "local"}, ensure_ascii=False) + "\n")
+    except Exception: pass
+    subprocess.run(["logger", "-t", "wg-health", f"检测到重启风暴：5 分钟 {n} 次"], capture_output=True)
+try: json.dump(st, open(f, "w"))
+except Exception: pass
+PY
 # 审计日志裁剪（最多 500 行）
 if [ -f "$DATA_DIR/audit.log" ]; then
   n=$(wc -l < "$DATA_DIR/audit.log" 2>/dev/null || echo 0)
