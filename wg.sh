@@ -1798,6 +1798,12 @@ def api_batch_export():
 @app.route("/api/restart", methods=["POST"])
 def api_restart():
     if not is_authenticated(): return jsonify({"error":"未认证"}), 401
+    # 防抖：短时间内重复重启直接拒绝，避免快速连续重启触发 systemd start-limit-hit
+    now = time.time()
+    last = getattr(app, "_last_restart_ts", 0)
+    if now - last < 5:
+        return jsonify({"success": True, "message": "重启请求过于频繁，已忽略（5 秒内仅一次）"})
+    app._last_restart_ts = now
     run(["systemctl","reset-failed","wg-quick@wg0"])
     out, err, code = run(["systemctl","restart","wg-quick@wg0"])
     if code != 0: return jsonify({"error":err or out}), 500
@@ -4760,12 +4766,14 @@ QSVC
   systemctl start wg-qos.service >/dev/null 2>&1 || true
   rollback_files+=("/etc/systemd/system/wg-qos.service")
 
-  # ---------- wg-quick@wg0 熔断阈值放宽（避免频繁重启触发 start-limit-hit） ----------
+# ---------- wg-quick@wg0 熔断阈值（避免频繁重启触发 start-limit-hit） ----------
+  # 该服务常被 Web/API/自愈重启，若按 systemd 默认（5次/10秒）极易触发 start-limit-hit
+  # 而拒绝对外提供服务。此处彻底关闭启动频率限制（Interval=0），并挂 QoS 重启后重下发。
   mkdir -p /etc/systemd/system/wg-quick@wg0.service.d
   cat > /etc/systemd/system/wg-quick@wg0.service.d/10-override.conf << 'WGDROP'
 [Unit]
-StartLimitIntervalSec=60
-StartLimitBurst=10
+StartLimitIntervalSec=0
+StartLimitBurst=0
 [Service]
 Restart=no
 ExecStartPost=-/bin/bash -c 'sleep 1; [ -x /opt/wireguard-web/scripts/wg-qos.sh ] && /opt/wireguard-web/scripts/wg-qos.sh apply'
