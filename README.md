@@ -21,7 +21,7 @@
 - **超配额降速**：超额后可选择「降速」而非直接封禁，周期重置自动解除。
 - **HTTP JSON API v1**：面向 App / 自动化，双令牌体系（管理员令牌 + 客户端订阅令牌）。
 - **备份 / 恢复**：一键打包配置、数据、服务与脚本，恢复后自动重载。
-- **自愈与体检**：定时检查并重启异常服务；`wgd doctor` 一键体检。
+- **自愈与体检**：定时检查并重启异常服务（含熔断恢复与冷却防抖）；`wgd doctor` 一键体检。
 - **安全**：Cookie `HttpOnly`、CSRF 同源校验、登录限流、备份路径穿越防护、身份 ID 反泄露审计。
 
 ---
@@ -34,10 +34,6 @@
 curl -fsSL -o wg.sh https://raw.githubusercontent.com/xaxanb/xa_wg/main/wg.sh
 bash wg.sh --auto
 ```
-```bash
-bash wg.sh --auto --555
-```
-- bash wg.sh --auto --555 这样就是使用555端口
 
 - 默认 WireGuard 监听 **53/UDP**，自动选择 DNS，并部署 + 对外暴露 Web/API（**5666**）。
 - 安装完成后会打印 **Web 访问地址、用户名/密码、API 管理员令牌**，请妥善保存。

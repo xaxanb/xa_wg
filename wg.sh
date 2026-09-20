@@ -1798,6 +1798,7 @@ def api_batch_export():
 @app.route("/api/restart", methods=["POST"])
 def api_restart():
     if not is_authenticated(): return jsonify({"error":"未认证"}), 401
+    run(["systemctl","reset-failed","wg-quick@wg0"])
     out, err, code = run(["systemctl","restart","wg-quick@wg0"])
     if code != 0: return jsonify({"error":err or out}), 500
     return jsonify({"success":True,"message":"WireGuard 已重启"})
@@ -4745,7 +4746,6 @@ QOSEOF
 [Unit]
 Description=WireGuard QoS (tc rate limit)
 After=wg-quick@wg0.service
-PartOf=wg-quick@wg0.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
@@ -4760,6 +4760,19 @@ QSVC
   systemctl start wg-qos.service >/dev/null 2>&1 || true
   rollback_files+=("/etc/systemd/system/wg-qos.service")
 
+  # ---------- wg-quick@wg0 熔断阈值放宽（避免频繁重启触发 start-limit-hit） ----------
+  mkdir -p /etc/systemd/system/wg-quick@wg0.service.d
+  cat > /etc/systemd/system/wg-quick@wg0.service.d/10-override.conf << 'WGDROP'
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=10
+[Service]
+Restart=no
+ExecStartPost=-/bin/bash -c 'sleep 1; [ -x /opt/wireguard-web/scripts/wg-qos.sh ] && /opt/wireguard-web/scripts/wg-qos.sh apply'
+WGDROP
+  systemctl daemon-reload
+  rollback_files+=("/etc/systemd/system/wg-quick@wg0.service.d/10-override.conf")
+
   # 统一 Python 解释器
   if [ -n "$PYTHON_BIN" ] && [ "$PYTHON_BIN" != "python3" ]; then
     sed -i "s|python3 - |$PYTHON_BIN - |g" "$WEB_DIR/scripts/wg-qos.sh"
@@ -4770,30 +4783,73 @@ QSVC
   cat > "$WEB_DIR/scripts/wg-health.sh" << 'HEALTHEOF'
 #!/bin/bash
 # wg-health.sh — 关键服务存活检查；异常自动重启并记录审计
+# 关键改进：区分「停止/失败/启动频率超限」，用 start 而非 restart，
+#           失败时先 reset-failed 解除熔断；对同一服务加冷却，避免自愈制造重启风暴。
 DATA_DIR="/opt/wireguard-web/data"
+STATE_FILE="$DATA_DIR/health_state.json"
+COOLDOWN=120          # 同一服务两次自愈最小间隔（秒）
 mkdir -p "$DATA_DIR"
 audit() {
   echo "{\"ts\":\"$(date '+%Y-%m-%d %H:%M:%S')\",\"action\":\"自愈\",\"detail\":\"$1\",\"ip\":\"local\"}" >> "$DATA_DIR/audit.log"
   logger -t wg-health "$1" 2>/dev/null || true
 }
+# 冷却判断：返回 0=允许重启，1=冷却中
+cooled() { # svc
+  python3 - "$STATE_FILE" "$1" "$COOLDOWN" <<'PY'
+import json,os,sys,time
+f,svc,cd=sys.argv[1],sys.argv[2],int(sys.argv[3])
+d={}
+if os.path.exists(f):
+    try: d=json.load(open(f))
+    except Exception: d={}
+last=float(d.get(svc,0))
+sys.exit(1 if (time.time()-last)<cd else 0)
+PY
+}
+mark() { # svc
+  python3 - "$STATE_FILE" "$1" <<'PY'
+import json,os,sys,time
+f,svc=sys.argv[1],sys.argv[2]
+d={}
+if os.path.exists(f):
+    try: d=json.load(open(f))
+    except Exception: d={}
+d[svc]=time.time()
+try: json.dump(d,open(f,"w"))
+except Exception: pass
+PY
+}
 check_restart() { # name
   local svc="$1"
-  if ! systemctl is-active --quiet "$svc"; then
-    audit "服务 $svc 异常，尝试重启"
-    systemctl restart "$svc" 2>/dev/null || true
-    sleep 2
-    if systemctl is-active --quiet "$svc"; then
-      audit "$svc 已恢复"
-    else
-      audit "$svc 重启失败，请手动检查"
-    fi
+  systemctl is-active --quiet "$svc" && return 0
+  # 启动频率超限（熔断）：先 reset-failed 解除，再 start
+  if systemctl is-failed --quiet "$svc" || [ "$(systemctl show -p Result --value "$svc" 2>/dev/null)" = "start-limit-hit" ]; then
+    if ! cooled "$svc"; then return 0; fi
+    mark "$svc"
+    audit "服务 $svc 处于失败/熔断状态，reset-failed 后尝试启动"
+    systemctl reset-failed "$svc" 2>/dev/null || true
+  else
+    if ! cooled "$svc"; then return 0; fi
+    mark "$svc"
+    audit "服务 $svc 未运行，尝试启动"
+  fi
+  systemctl start "$svc" 2>/dev/null || true
+  sleep 2
+  if systemctl is-active --quiet "$svc"; then
+    audit "$svc 已恢复"
+  else
+    audit "$svc 启动失败，请手动检查"
   fi
 }
 check_restart wg-quick@wg0
 check_restart wg-web
 if ! systemctl is-active --quiet wg-limiter.timer; then
-  audit "限流定时器异常，尝试重启"
-  systemctl restart wg-limiter.timer 2>/dev/null || true
+  if cooled "wg-limiter.timer"; then
+    mark "wg-limiter.timer"
+    audit "限流定时器异常，尝试重启"
+    systemctl reset-failed wg-limiter.timer 2>/dev/null || true
+    systemctl start wg-limiter.timer 2>/dev/null || true
+  fi
 fi
 # 审计日志裁剪（最多 500 行）
 if [ -f "$DATA_DIR/audit.log" ]; then
@@ -5077,8 +5133,8 @@ print(f'服务器总流量上限已设为 {b} bytes')"
     [ -z "$2" ] && { echo "用法：wgd restore <备份文件>"; exit 1; }
     [ -n "$WG_SCRIPT" ] && bash "$WG_SCRIPT" --do-restore "$2" || echo "未找到 wg.sh"
     ;;
-  restart) systemctl restart wg-quick@wg0 && echo "WireGuard 已重启" || echo "重启失败" ;;
-  start) systemctl start wg-quick@wg0 && echo "WireGuard 已启动" || echo "启动失败" ;;
+  restart) systemctl reset-failed wg-quick@wg0 2>/dev/null; systemctl restart wg-quick@wg0 && echo "WireGuard 已重启" || echo "重启失败" ;;
+  start) systemctl reset-failed wg-quick@wg0 2>/dev/null; systemctl start wg-quick@wg0 && echo "WireGuard 已启动" || echo "启动失败" ;;
   stop) systemctl stop wg-quick@wg0 && echo "WireGuard 已停止" || echo "停止失败" ;;
   log) journalctl -fu wg-quick@wg0 -n 50 ;;
   web)
@@ -5269,6 +5325,13 @@ PYEOF
     chk "wg 命令" "command -v wg"
     chk "配置文件存在" "[ -f \"$WG_CONF\" ]"
     chk "wg-quick@wg0 运行中" "systemctl is-active --quiet wg-quick@wg0" "可执行 wgd restart"
+    sl_result=$(systemctl show -p Result --value wg-quick@wg0 2>/dev/null)
+    if [ "$sl_result" = "start-limit-hit" ]; then
+      echo "  [✗] wg-quick@wg0 启动频率超限（start-limit-hit），已尝试自动解除"
+      systemctl reset-failed wg-quick@wg0 2>/dev/null || true
+      systemctl start wg-quick@wg0 2>/dev/null || true
+      bad=$((bad+1))
+    fi
     if [ -f /opt/wireguard-web/.env ]; then
       chk "wg-web 运行中" "systemctl is-active --quiet wg-web" "可执行 wgd web restart"
       chk "wg-limiter.timer 运行中" "systemctl is-active --quiet wg-limiter.timer"
@@ -5697,6 +5760,10 @@ remove_web_ui() {
   rm -f /etc/systemd/system/wg-health.timer
   rm -f /etc/systemd/system/wg-traffic.service
   rm -f /etc/systemd/system/wg-traffic.timer
+  # 清理 wg-quick@wg0 熔断阈值 drop-in
+  rm -f /etc/systemd/system/wg-quick@wg0.service.d/10-override.conf
+  rmdir /etc/systemd/system/wg-quick@wg0.service.d 2>/dev/null
+  systemctl reset-failed wg-quick@wg0 2>/dev/null
   # 清理 QoS（tc 规则 + ifb0）
   tc qdisc del dev wg0 root 2>/dev/null
   tc qdisc del dev wg0 ingress 2>/dev/null
